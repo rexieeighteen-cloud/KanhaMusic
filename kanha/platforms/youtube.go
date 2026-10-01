@@ -1,11 +1,3 @@
-# Copyright (C) 2021-2022 by Oyekanhaa@Github, < https://github.com/Oyekanhaa>.
-#
-# This file is part of < https://github.com/Oyekanhaa/KanhaMusic > project,
-# and is released under the "GNU v3.0 License Agreement".
-# Please see < https://github.com/Oyekanhaa/KanhaMusic/blob/master/LICENSE >
-#
-# All rights reserved
-
 import asyncio
 import os
 import re
@@ -16,8 +8,9 @@ from pyrogram.types import Message
 from py_yt import VideosSearch, Playlist
 import aiohttp
 
-API_URL = os.environ.get("MEOW_API_URL", "https://music.yukiapi.site")
-API_KEY = os.environ.get("MEOW_API_KEY", "YOUR_API_KEY") # 🔑 Get Key: @MeowApiRobot On Telegram
+API_URL = os.environ.get("SHRUTI_API_URL", "https://api.shrutibots.site")
+
+API_KEY = os.environ.get("SHRUTI_API_KEY", "YOUR_API_KEY") ## Get This API KEY FROM TELEGRAM BOT USERNAME: @SHRUTIAPIBOT 
 
 DOWNLOAD_DIR = "downloads"
 
@@ -34,21 +27,22 @@ async def download_song(link: str) -> str:
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
-
-    if os.path.exists(file_path) and os.path.getsize(file_path) > 10000:
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
         return file_path
 
     try:
         async with aiohttp.ClientSession() as session:
-            stream_url = f"{API_URL}/stream/{video_id}?key={API_KEY}&type=audio&quality=128"
-            async with session.get(stream_url, timeout=aiohttp.ClientTimeout(total=300)) as resp:
+            async with session.get(
+                f"{API_URL}/download",
+                params={"url": video_id, "type": "audio", "api_key": API_KEY},
+                timeout=aiohttp.ClientTimeout(total=300)
+            ) as resp:
                 if resp.status != 200:
                     return None
                 with open(file_path, "wb") as f:
                     async for chunk in resp.content.iter_chunked(131072):
                         f.write(chunk)
-
-        if os.path.exists(file_path) and os.path.getsize(file_path) > 10000:
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
             return file_path
         return None
     except Exception:
@@ -67,21 +61,22 @@ async def download_video(link: str) -> str:
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp4")
-
-    if os.path.exists(file_path) and os.path.getsize(file_path) > 10000:
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
         return file_path
 
     try:
         async with aiohttp.ClientSession() as session:
-            stream_url = f"{API_URL}/stream/{video_id}?key={API_KEY}&type=video&quality=480"
-            async with session.get(stream_url, timeout=aiohttp.ClientTimeout(total=600)) as resp:
+            async with session.get(
+                f"{API_URL}/download",
+                params={"url": video_id, "type": "video", "api_key": API_KEY},
+                timeout=aiohttp.ClientTimeout(total=600)
+            ) as resp:
                 if resp.status != 200:
                     return None
                 with open(file_path, "wb") as f:
                     async for chunk in resp.content.iter_chunked(131072):
                         f.write(chunk)
-
-        if os.path.exists(file_path) and os.path.getsize(file_path) > 10000:
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
             return file_path
         return None
     except Exception:
@@ -91,6 +86,45 @@ async def download_video(link: str) -> str:
             except Exception:
                 pass
         return None
+
+
+AUTOPLAY_REQUEST_TIMEOUT = 60
+AUTOPLAY_MAX_RETRIES = 6
+AUTOPLAY_RETRY_DELAY = 3
+AUTOPLAY_RETRYABLE_STATUS = (408, 425, 429, 500, 502, 503, 504)
+
+
+async def get_autoplay(video_id: str) -> list:
+    video_id = video_id.split("v=")[-1].split("&")[0] if "v=" in video_id else video_id
+    if not video_id or len(video_id) < 3:
+        return []
+
+    attempt = 0
+    while attempt < AUTOPLAY_MAX_RETRIES:
+        attempt += 1
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{API_URL}/autoplay",
+                    params={"video_id": video_id, "api_key": API_KEY},
+                    timeout=aiohttp.ClientTimeout(total=AUTOPLAY_REQUEST_TIMEOUT),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("tracks", [])
+                    if resp.status in AUTOPLAY_RETRYABLE_STATUS and attempt < AUTOPLAY_MAX_RETRIES:
+                        await asyncio.sleep(AUTOPLAY_RETRY_DELAY)
+                        continue
+                    return []
+        except (asyncio.TimeoutError, aiohttp.ClientError):
+            if attempt < AUTOPLAY_MAX_RETRIES:
+                await asyncio.sleep(AUTOPLAY_RETRY_DELAY)
+                continue
+            return []
+        except Exception:
+            return []
+
+    return []
 
 
 class YouTubeAPI:
