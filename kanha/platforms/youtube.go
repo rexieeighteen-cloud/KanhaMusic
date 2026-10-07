@@ -1,3 +1,8 @@
+/*
+ * ● KanhaMusic
+ * ○ YouTube platform with Shruti API downloader.
+ */
+
 package platforms
 
 import (
@@ -5,12 +10,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	state "KanhaMusic/kanha/core/models"
 	td "github.com/Kanha/Meow"
@@ -25,7 +32,9 @@ func init() {
 }
 
 func (p *YouTubePlatform) Name() state.PlatformName { return PlatformYouTube }
-func (p *YouTubePlatform) Priority() int            { return 80 }
+
+// Keep YouTube above MeowApi so Shruti is tried first for YouTube downloads.
+func (p *YouTubePlatform) Priority() int { return 90 }
 
 func (p *YouTubePlatform) CanGet(query string) bool {
 	query = strings.TrimSpace(query)
@@ -69,6 +78,7 @@ func (p *YouTubePlatform) Get(query string, video bool) ([]*state.Track, error) 
 		track.Video = video
 		tracks = append(tracks, track)
 	}
+
 	if len(tracks) == 0 {
 		return nil, errors.New("no playable YouTube result found")
 	}
@@ -79,21 +89,136 @@ func (p *YouTubePlatform) Get(query string, video bool) ([]*state.Track, error) 
 }
 
 func (p *YouTubePlatform) CanDownload(source state.PlatformName) bool {
-	return source == PlatformYouTube || source == PlatformYtDlp
+	return source == PlatformYouTube
 }
 
-func (p *YouTubePlatform) Download(ctx context.Context, track *state.Track, msg *td.Message) (string, error) {
+// Download uses the Shruti API instead of yt-dlp for the actual media file.
+// Required Railway variables:
+//
+//	SHRUTI_API_URL=https://api.shrutibots.site
+//	SHRUTI_API_KEY=<your Shruti API key>
+func (p *YouTubePlatform) Download(ctx context.Context, track *state.Track, _ *td.Message) (string, error) {
 	if track == nil {
 		return "", errors.New("nil track")
 	}
-	return (&YtdlpPlatform{}).Download(ctx, track, msg)
+
+	if cached := findFile(track); cached != "" {
+		return cached, nil
+	}
+
+	apiURL := strings.TrimRight(os.Getenv("SHRUTI_API_URL"), "/")
+	if apiURL == "" {
+		apiURL = "https://api.shrutibots.site"
+	}
+	apiKey := strings.TrimSpace(os.Getenv("SHRUTI_API_KEY"))
+	if apiKey == "" {
+		return "", errors.New("SHRUTI_API_KEY is not configured")
+	}
+
+	videoID := strings.TrimSpace(track.ID)
+	if videoID == "" {
+		videoID = extractYouTubeID(track.URL)
+	}
+	if videoID == "" {
+		return "", errors.New("missing YouTube video id")
+	}
+
+	mediaType := "audio"
+	ext := ".mp3"
+	timeout := 5 * time.Minute
+	if track.Video {
+		mediaType = "video"
+		ext = ".mp4"
+		timeout = 10 * time.Minute
+	}
+
+	path := getPath(track, ext)
+	if err := os.MkdirAll("downloads", 0755); err != nil {
+		return "", fmt.Errorf("create downloads directory: %w", err)
+	}
+
+	values := url.Values{}
+	values.Set("url", videoID)
+	values.Set("type", mediaType)
+	values.Set("api_key", apiKey)
+
+	reqURL := apiURL + "/download?" + values.Encode()
+
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("create Shruti request: %w", err)
+	}
+	req.Header.Set("User-Agent", "KanhaMusic/1.0")
+	req.Header.Set("Accept", "*/*")
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		os.Remove(path)
+		if reqCtx.Err() != nil {
+			return "", fmt.Errorf("Shruti download timeout/cancelled: %w", reqCtx.Err())
+		}
+		return "", fmt.Errorf("Shruti request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		os.Remove(path)
+		return "", fmt.Errorf("Shruti API returned HTTP %d", resp.StatusCode)
+	}
+
+	file, err := os.Create(path)
+	if err != nil {
+		return "", fmt.Errorf("create output file: %w", err)
+	}
+
+	_, copyErr := copyResponse(file, resp)
+	closeErr := file.Close()
+	if copyErr != nil {
+		os.Remove(path)
+		return "", fmt.Errorf("Shruti download failed: %w", copyErr)
+	}
+	if closeErr != nil {
+		os.Remove(path)
+		return "", fmt.Errorf("close downloaded file: %w", closeErr)
+	}
+
+	if !fileExists(path) {
+		os.Remove(path)
+		return "", errors.New("Shruti API returned an empty file")
+	}
+
+	return path, nil
 }
 
-func (p *YouTubePlatform) DownloadTrack(ctx context.Context, track *state.Track) (string, error) {
-	return p.Download(ctx, track, nil)
+func copyResponse(dst *os.File, resp *http.Response) (int64, error) {
+	var total int64
+	buf := make([]byte, 128*1024)
+
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			written, err := dst.Write(buf[:n])
+			total += int64(written)
+			if err != nil {
+				return total, err
+			}
+			if written != n {
+				return total, errors.New("short write while saving Shruti download")
+			}
+		}
+		if readErr != nil {
+			if readErr.Error() == "EOF" {
+				return total, nil
+			}
+			return total, readErr
+		}
+	}
 }
 
-// VideoSearch keeps compatibility with registry.go, which passes the video flag.
+// VideoSearch keeps compatibility with registry.go.
 func (p *YouTubePlatform) VideoSearch(query string, video bool) ([]*state.Track, error) {
 	return p.Get(query, video)
 }
@@ -160,10 +285,7 @@ type ytInfo struct {
 	Title       string  `json:"title"`
 	Duration    float64 `json:"duration"`
 	WebpageURL  string  `json:"webpage_url"`
-	URL         string  `json:"url"`
 	Thumbnail   string  `json:"thumbnail"`
-	Uploader    string  `json:"uploader"`
-	Channel     string  `json:"channel"`
 	LiveStatus  string  `json:"live_status"`
 	IsLive      bool    `json:"is_live"`
 	OriginalURL string  `json:"original_url"`
@@ -173,10 +295,12 @@ func (p *YouTubePlatform) toTrack(info ytInfo) *state.Track {
 	if info.ID == "" {
 		return nil
 	}
+
 	title := strings.TrimSpace(info.Title)
 	if title == "" {
 		title = "YouTube Track"
 	}
+
 	trackURL := strings.TrimSpace(info.WebpageURL)
 	if trackURL == "" {
 		trackURL = strings.TrimSpace(info.OriginalURL)
@@ -184,6 +308,7 @@ func (p *YouTubePlatform) toTrack(info ytInfo) *state.Track {
 	if trackURL == "" {
 		trackURL = "https://www.youtube.com/watch?v=" + info.ID
 	}
+
 	artwork := strings.TrimSpace(info.Thumbnail)
 	if artwork == "" {
 		artwork = fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", info.ID)
@@ -200,7 +325,6 @@ func (p *YouTubePlatform) toTrack(info ytInfo) *state.Track {
 	}
 }
 
-// withVideo applies the requested playback mode to a list of tracks.
 func withVideo(tracks []*state.Track, video bool) []*state.Track {
 	for _, track := range tracks {
 		if track != nil {
@@ -220,6 +344,7 @@ func ytDlpJSON(target string) ([]ytInfo, error) {
 		"--skip-download", "--ignore-errors", "--no-playlist",
 		"--socket-timeout", "20", "--retries", "2", "--", target,
 	}
+
 	output, err := runCommand(context.Background(), "yt-dlp", args...)
 	if err != nil {
 		if strings.TrimSpace(output) == "" {
@@ -243,6 +368,7 @@ func ytDlpJSON(target string) ([]ytInfo, error) {
 		}
 		items = append(items, info)
 	}
+
 	if len(items) == 0 {
 		return nil, errors.New("yt-dlp returned no usable YouTube metadata")
 	}
@@ -261,6 +387,7 @@ func isYouTubeURL(value string) bool {
 	if err != nil {
 		return false
 	}
+
 	host := strings.ToLower(strings.TrimPrefix(parsed.Hostname(), "www."))
 	switch host {
 	case "youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be":
@@ -272,24 +399,25 @@ func isYouTubeURL(value string) bool {
 
 func extractYouTubeID(value string) string {
 	parsed, err := url.Parse(strings.TrimSpace(value))
-	if err != nil {
-		return ""
-	}
-	host := strings.ToLower(strings.TrimPrefix(parsed.Hostname(), "www."))
-	if host == "youtu.be" {
-		if id := strings.Trim(parsed.Path, "/"); id != "" {
-			return id
+	if err == nil {
+		host := strings.ToLower(strings.TrimPrefix(parsed.Hostname(), "www."))
+		if host == "youtu.be" {
+			if id := strings.Trim(parsed.Path, "/"); id != "" {
+				return id
+			}
+		}
+
+		if strings.Contains(host, "youtube.com") {
+			if id := parsed.Query().Get("v"); id != "" {
+				return id
+			}
+			parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+			if len(parts) >= 2 && (parts[0] == "shorts" || parts[0] == "embed" || parts[0] == "live") {
+				return parts[1]
+			}
 		}
 	}
-	if strings.Contains(host, "youtube.com") {
-		if id := parsed.Query().Get("v"); id != "" {
-			return id
-		}
-		parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
-		if len(parts) >= 2 && (parts[0] == "shorts" || parts[0] == "embed" || parts[0] == "live") {
-			return parts[1]
-		}
-	}
+
 	re := regexp.MustCompile(`(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{11})(?:$|[^A-Za-z0-9_-])`)
 	if match := re.FindStringSubmatch(value); len(match) == 2 {
 		return match[1]
