@@ -354,7 +354,7 @@ func (bm *broadcastManager) run(
 		if r := recover(); r != nil {
 			logger.Errorf("Broadcast panic recovered: %v", r)
 		}
-		bm.finalize(c, progressMsg, stats)
+		safeBroadcastFinalize(bm, c, progressMsg, stats)
 	}()
 
 	targets := make([]broadcastTarget, 0, len(chats)+len(users))
@@ -382,9 +382,8 @@ func (bm *broadcastManager) run(
 	}
 }
 
-// safeBroadcastSend prevents a recipient-specific panic from terminating the
-// broadcast worker. A bad target is recorded as a failed delivery and the
-// remaining recipients continue.
+// safeBroadcastSend isolates a recipient-specific panic so one bad target
+// cannot crash the process or terminate delivery to every other target.
 func safeBroadcastSend(bm *broadcastManager, c *td.Client, m *td.Message, targetID int64, content string, flags *BroadcastFlags) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -393,6 +392,17 @@ func safeBroadcastSend(bm *broadcastManager, c *td.Client, m *td.Message, target
 		}
 	}()
 	return bm.send(c, m, targetID, content, flags)
+}
+
+// safeBroadcastFinalize prevents a Telegram API or formatting panic during
+// final status reporting from taking down the bot process.
+func safeBroadcastFinalize(bm *broadcastManager, c *td.Client, progressMsg *td.Message, stats *BroadcastStats) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Errorf("Broadcast finalize panic recovered: %v", r)
+		}
+	}()
+	bm.finalize(c, progressMsg, stats)
 }
 
 func (bm *broadcastManager) send(
@@ -490,6 +500,11 @@ func (bm *broadcastManager) updateProgress(
 	progressMsg *td.Message,
 	stats *BroadcastStats,
 ) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Errorf("Broadcast progress panic recovered: %v", r)
+		}
+	}()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
