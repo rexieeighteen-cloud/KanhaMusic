@@ -373,13 +373,26 @@ func (bm *broadcastManager) run(
 		default:
 		}
 
-		recordTarget(t, bm.send(c, m, t.id, content, flags), stats)
+		recordTarget(t, safeBroadcastSend(bm, c, m, t.id, content, flags), stats)
 
 		sent++
 		if !bm.wait(ctx, sent, flags.Delay) {
 			return
 		}
 	}
+}
+
+// safeBroadcastSend prevents a recipient-specific panic from terminating the
+// broadcast worker. A bad target is recorded as a failed delivery and the
+// remaining recipients continue.
+func safeBroadcastSend(bm *broadcastManager, c *td.Client, m *td.Message, targetID int64, content string, flags *BroadcastFlags) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("recovered broadcast send panic: %v", r)
+			logger.Errorf("Broadcast send panic for %d: %v", targetID, r)
+		}
+	}()
+	return bm.send(c, m, targetID, content, flags)
 }
 
 func (bm *broadcastManager) send(
